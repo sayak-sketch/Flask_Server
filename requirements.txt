@@ -6,4 +6,4 @@ certifi==2024.2.2
 cryptography==42.0.5
 gunicorn==21.2.0
 gevent==24.2.1
-gevent-websocket==0.36.9
+gevent-websocket==0.10.1
