@@ -31,11 +31,11 @@ app = Flask(__name__)
 CORS(app)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_USE_ENV_VAR")
 
-# Eventlet is required for production WebSocket concurrency
+# Switched to gevent for stable production WebSocket concurrency
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
-    async_mode=os.environ.get("SOCKETIO_ASYNC_MODE", "eventlet")
+    async_mode=os.environ.get("SOCKETIO_ASYNC_MODE", "gevent")
 )
 
 # ---------------------------------------------------------------------------
