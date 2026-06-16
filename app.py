@@ -5,8 +5,6 @@ A completely blind signaling and relay server for E2EE clients.
 The server never decrypts messages, computes shared secrets, or 
 holds private key material.
 """
-import eventlet
-eventlet.monkey_patch()
 import os
 import logging
 import base64
@@ -34,9 +32,9 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "CHANGE_ME_IN_PRODUCTION
 
 # Switched to gevent for stable production WebSocket concurrency
 socketio = SocketIO(
-    app, 
-    cors_allowed_origins="*", 
-    async_mode="eventlet"
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading"
 )
 
 # ---------------------------------------------------------------------------
