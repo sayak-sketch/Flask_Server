@@ -142,13 +142,20 @@ def get_messages():
 # ===========================================================================
 @app.route("/keys/upload", methods=["POST"])
 def upload_keys():
-    """Client publishes their PUBLIC X3DH key bundle."""
+    """Client publishes their PUBLIC Hybrid PQ-X3DH key bundle."""
     data = request.get_json(force=True, silent=True) or {}
     phone = data.get("phone", "").strip()
-    ik_pub, sign_pub, spk_pub, sig, otpks_pub = data.get("identityKey"), data.get("identitySignKey"), data.get("signedPreKey"), data.get("signature"), data.get("oneTimePreKeys", [])
+    
+    # Extract both classical and quantum keys
+    ik_pub = data.get("identityKey")
+    sign_pub = data.get("identitySignKey")
+    spk_pub = data.get("signedPreKey")
+    sig = data.get("signature")
+    quantum_pub = data.get("quantumPreKey") # <--- NEW: 1,184-byte ML-KEM Key
+    otpks_pub = data.get("oneTimePreKeys", [])
 
-    if not all([phone, ik_pub, sign_pub, spk_pub, sig]):
-        return jsonify({"status": False, "message": "Missing required fields."}), 400
+    if not all([phone, ik_pub, sign_pub, spk_pub, sig, quantum_pub]):
+        return jsonify({"status": False, "message": "Missing required cryptographic fields, including Quantum PreKey."}), 400
 
     # Blind Signature Verification
     try:
@@ -158,14 +165,19 @@ def upload_keys():
         return jsonify({"status": False, "message": "Invalid prekey signature."}), 400
 
     db.public_keys.update_one({"phone": phone}, {"$set": {
-        "identityKey": ik_pub, "identitySignKey": sign_pub, "signedPreKey": spk_pub,
-        "signature": sig, "oneTimePreKeys": otpks_pub, "updated_at": _now()
+        "identityKey": ik_pub, 
+        "identitySignKey": sign_pub, 
+        "signedPreKey": spk_pub,
+        "signature": sig, 
+        "quantumPreKey": quantum_pub, # <--- NEW: Stored in database
+        "oneTimePreKeys": otpks_pub, 
+        "updated_at": _now()
     }}, upsert=True)
-    return jsonify({"status": True, "message": "Public Keys stored."}), 200
+    return jsonify({"status": True, "message": "Hybrid Public Keys stored securely."}), 200
 
 @app.route("/keys/fetch", methods=["GET"])
 def fetch_keys():
-    """Alice fetches Bob's public key bundle."""
+    """Alice fetches Bob's hybrid public key bundle."""
     target = request.args.get("target_phone", "").strip()
     user_keys = db.public_keys.find_one({"phone": target})
     
@@ -173,11 +185,17 @@ def fetch_keys():
         return jsonify({"status": False, "message": "No key bundle found."}), 404
 
     otpk_b64, otpk_index = _pop_otpk(target)
+    
+    # Serve the massive ML-KEM key back to Alice alongside the classical keys
     return jsonify({
-        "status": True, "identityKey": user_keys["identityKey"],
+        "status": True, 
+        "identityKey": user_keys["identityKey"],
         "identitySignKey": user_keys.get("identitySignKey"),
-        "signedPreKey": user_keys["signedPreKey"], "signature": user_keys["signature"],
-        "oneTimePreKey": otpk_b64, "otpkIndex": otpk_index
+        "signedPreKey": user_keys["signedPreKey"], 
+        "signature": user_keys["signature"],
+        "quantumPreKey": user_keys.get("quantumPreKey"), # <--- NEW: Served to Alice
+        "oneTimePreKey": otpk_b64, 
+        "otpkIndex": otpk_index
     }), 200
 
 # ===========================================================================
