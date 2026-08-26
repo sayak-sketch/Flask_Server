@@ -91,6 +91,7 @@ def health_check():
 def api_signup():
     data = request.get_json(force=True, silent=True) or {}
     phone, password, name = data.get("phone", "").strip(), data.get("password", ""), data.get("name", "").strip()
+    image = data.get("image", "") # <--- NEW: Extract image from request
 
     if not phone or not password:
         return jsonify({"status": False, "message": "Phone and password are required."}), 400
@@ -99,7 +100,7 @@ def api_signup():
 
     user_id = db.users.insert_one({
         "phone": phone, "password": generate_password_hash(password),
-        "name": name, "online": False, "sid": None, "created_at": _now(),
+        "name": name, "image": image, "online": False, "sid": None, "created_at": _now(), # <--- NEW: Save image to DB
     }).inserted_id
     return jsonify({"status": True, "message": "Account created.", "userId": str(user_id)}), 201
 
@@ -110,32 +111,26 @@ def api_login():
 
     user = db.users.find_one({"phone": phone})
     if user and check_password_hash(user["password"], password):
-        return jsonify({"status": True, "userId": str(user["_id"]), "name": user.get("name")}), 200
+        return jsonify({
+            "status": True, 
+            "userId": str(user["_id"]), 
+            "name": user.get("name"),
+            "image": user.get("image", "") # <--- NEW: Send image on successful login
+        }), 200
     return jsonify({"status": False, "message": "Invalid credentials."}), 401
 
 @app.route("/users", methods=["GET"])
 def get_users():
     uid = request.args.get("userId", "")
     query = {"_id": {"$ne": ObjectId(uid)}} if ObjectId.is_valid(uid) else {}
-    users = [{"id": str(u["_id"]), "name": u.get("name"), "phone": u.get("phone"), "online": u.get("online", False)} for u in db.users.find(query)]
+    users = [{
+        "id": str(u["_id"]), 
+        "name": u.get("name"), 
+        "phone": u.get("phone"), 
+        "image": u.get("image", ""), # <--- NEW: Include image when fetching contacts list
+        "online": u.get("online", False)
+    } for u in db.users.find(query)]
     return jsonify(users), 200
-
-@app.route("/messages", methods=["GET"])
-def get_messages():
-    sender, receiver = request.args.get("sender", "").strip(), request.args.get("receiver", "").strip()
-    messages = list(db.messages.find({"$or": [{"sender": sender, "receiver": receiver}, {"sender": receiver, "receiver": sender}]}).sort("timestamp", 1))
-    
-    output = []
-    for msg in messages:
-        entry = {
-            "sender": msg["sender"], "receiver": msg["receiver"],
-            "ciphertext": msg.get("ciphertext", ""), "header": msg.get("header", {}),
-            "dateTime": msg["timestamp"].isoformat(), "status": msg.get("status", 1),
-        }
-        if msg.get("alice_ik_pub"):
-            entry.update({"alice_ik_pub": msg["alice_ik_pub"], "alice_ek_pub": msg["alice_ek_pub"], "otpk_index": msg.get("otpk_index")})
-        output.append(entry)
-    return jsonify(output), 200
 
 # ===========================================================================
 # HTTP API — PUBLIC KEY DISTRIBUTION
@@ -151,7 +146,7 @@ def upload_keys():
     sign_pub = data.get("identitySignKey")
     spk_pub = data.get("signedPreKey")
     sig = data.get("signature")
-    quantum_pub = data.get("quantumPreKey") # <--- NEW: 1,184-byte ML-KEM Key
+    quantum_pub = data.get("quantumPreKey") 
     otpks_pub = data.get("oneTimePreKeys", [])
 
     if not all([phone, ik_pub, sign_pub, spk_pub, sig, quantum_pub]):
@@ -169,7 +164,7 @@ def upload_keys():
         "identitySignKey": sign_pub, 
         "signedPreKey": spk_pub,
         "signature": sig, 
-        "quantumPreKey": quantum_pub, # <--- NEW: Stored in database
+        "quantumPreKey": quantum_pub, 
         "oneTimePreKeys": otpks_pub, 
         "updated_at": _now()
     }}, upsert=True)
@@ -193,7 +188,7 @@ def fetch_keys():
         "identitySignKey": user_keys.get("identitySignKey"),
         "signedPreKey": user_keys["signedPreKey"], 
         "signature": user_keys["signature"],
-        "quantumPreKey": user_keys.get("quantumPreKey"), # <--- NEW: Served to Alice
+        "quantumPreKey": user_keys.get("quantumPreKey"), 
         "oneTimePreKey": otpk_b64, 
         "otpkIndex": otpk_index
     }), 200
