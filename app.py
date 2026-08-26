@@ -27,10 +27,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(na
 logger = logging.getLogger("app")
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_USE_ENV_VAR")
 
-# Switched to gevent for stable production WebSocket concurrency
+# Switched to threading/gevent for stable production WebSocket concurrency
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
@@ -90,8 +90,10 @@ def health_check():
 @app.route("/signup", methods=["POST"])
 def api_signup():
     data = request.get_json(force=True, silent=True) or {}
-    phone, password, name = data.get("phone", "").strip(), data.get("password", ""), data.get("name", "").strip()
-    image = data.get("image", "") # <--- NEW: Extract image from request
+    phone = data.get("phone", "").strip()
+    password = data.get("password", "")
+    name = data.get("name", "").strip()
+    image = data.get("image", "") # Catch device avatar uploads
 
     if not phone or not password:
         return jsonify({"status": False, "message": "Phone and password are required."}), 400
@@ -100,14 +102,15 @@ def api_signup():
 
     user_id = db.users.insert_one({
         "phone": phone, "password": generate_password_hash(password),
-        "name": name, "image": image, "online": False, "sid": None, "created_at": _now(), # <--- NEW: Save image to DB
+        "name": name, "image": image, "online": False, "sid": None, "created_at": _now(),
     }).inserted_id
     return jsonify({"status": True, "message": "Account created.", "userId": str(user_id)}), 201
 
 @app.route("/login", methods=["POST"])
 def api_login():
     data = request.get_json(force=True, silent=True) or {}
-    phone, password = data.get("phone", "").strip(), data.get("password", "")
+    phone = data.get("phone", "").strip()
+    password = data.get("password", "")
 
     user = db.users.find_one({"phone": phone})
     if user and check_password_hash(user["password"], password):
@@ -115,7 +118,7 @@ def api_login():
             "status": True, 
             "userId": str(user["_id"]), 
             "name": user.get("name"),
-            "image": user.get("image", "") # <--- NEW: Send image on successful login
+            "image": user.get("image", "")
         }), 200
     return jsonify({"status": False, "message": "Invalid credentials."}), 401
 
@@ -127,7 +130,7 @@ def get_users():
         "id": str(u["_id"]), 
         "name": u.get("name"), 
         "phone": u.get("phone"), 
-        "image": u.get("image", ""), # <--- NEW: Include image when fetching contacts list
+        "image": u.get("image", ""),
         "online": u.get("online", False)
     } for u in db.users.find(query)]
     return jsonify(users), 200
@@ -216,7 +219,11 @@ def handle_register(data):
     # Deliver offline messages
     pending = list(db.messages.find({"receiver": phone, "status": 1}).sort("timestamp", 1))
     for msg in pending:
-        payload = {"msgId": str(msg["_id"]), "sender": msg["sender"], "receiver": msg["receiver"], "ciphertext": msg.get("ciphertext", ""), "header": msg.get("header", {}), "dateTime": msg["timestamp"].isoformat(), "status": 2}
+        payload = {
+            "msgId": str(msg["_id"]), "sender": msg["sender"], "receiver": msg["receiver"], 
+            "ciphertext": msg.get("ciphertext", ""), "header": msg.get("header", {}), 
+            "dateTime": msg["timestamp"].isoformat(), "status": 2
+        }
         if msg.get("alice_ik_pub"):
              payload.update({"alice_ik_pub": msg["alice_ik_pub"], "alice_ek_pub": msg["alice_ek_pub"], "otpk_index": msg.get("otpk_index"), "is_session_init": True})
         
@@ -226,7 +233,8 @@ def handle_register(data):
 
 @socketio.on("send_message")
 def handle_message(data):
-    sender, receiver, ciphertext, header = data.get("sender", "").strip(), data.get("receiver", "").strip(), data.get("ciphertext"), data.get("header", {})
+    sender, receiver = data.get("sender", "").strip(), data.get("receiver", "").strip()
+    ciphertext, header = data.get("ciphertext"), data.get("header", {})
     if not sender or not receiver or not ciphertext: return
 
     msg_doc = {"sender": sender, "receiver": receiver, "ciphertext": ciphertext, "header": header, "timestamp": _now(), "status": 1}
@@ -237,7 +245,11 @@ def handle_message(data):
 
     # Real-time delivery if online
     receiver_user = db.users.find_one({"phone": receiver})
-    payload = {"msgId": str(msg_id), "sender": sender, "receiver": receiver, "ciphertext": ciphertext, "header": header, "dateTime": msg_doc["timestamp"].isoformat(), "status": 2}
+    payload = {
+        "msgId": str(msg_id), "sender": sender, "receiver": receiver, 
+        "ciphertext": ciphertext, "header": header, "dateTime": msg_doc["timestamp"].isoformat(), "status": 2
+    }
+    
     if data.get("is_session_init"):
         payload.update({"alice_ik_pub": msg_doc.get("alice_ik_pub"), "alice_ek_pub": msg_doc.get("alice_ek_pub"), "otpk_index": msg_doc.get("otpk_index"), "is_session_init": True})
 
@@ -247,6 +259,15 @@ def handle_message(data):
         emit("message_status", {"msgId": str(msg_id), "status": 2}, room=sender)
     else:
         emit("message_status", {"msgId": str(msg_id), "status": 1}, room=sender)
+
+# --- NEW: Blind Relay for Message Deletion ---
+@socketio.on("delete_message")
+def handle_delete_message(data):
+    receiver = data.get("receiver", "").strip()
+    msg_id = data.get("msgId", "")
+    if receiver and msg_id:
+        # Relay deletion trigger directly to the recipient's room
+        emit("message_deleted", {"msgId": msg_id}, room=receiver)
 
 @socketio.on("message_read")
 def handle_read(data):
