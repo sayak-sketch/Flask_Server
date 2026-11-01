@@ -56,6 +56,7 @@ db.users.create_index("phone", unique=True)
 db.public_keys.create_index("phone", unique=True)
 db.messages.create_index([("sender", 1), ("receiver", 1), ("timestamp", 1)])
 db.messages.create_index([("receiver", 1), ("status", 1)])
+db.groups.create_index("members")
 
 # Clear ghost sessions on restart
 db.users.update_many({}, {"$set": {"online": False, "sid": None}})
@@ -93,7 +94,7 @@ def api_signup():
     phone = data.get("phone", "").strip()
     password = data.get("password", "")
     name = data.get("name", "").strip()
-    image = data.get("image", "") # Catch device avatar uploads
+    image = data.get("image", "")  # Catch device avatar uploads
 
     if not phone or not password:
         return jsonify({"status": False, "message": "Phone and password are required."}), 400
@@ -134,6 +135,68 @@ def get_users():
         "online": u.get("online", False)
     } for u in db.users.find(query)]
     return jsonify(users), 200
+
+# ===========================================================================
+# HTTP API — GROUPS (ZERO-KNOWLEDGE PAIRWISE FAN-OUT DIRECTORY)
+# ===========================================================================
+@app.route("/groups/create", methods=["POST"])
+def create_group():
+    """Creates a group metadata document and notifies online members."""
+    data = request.get_json(force=True, silent=True) or {}
+    name = data.get("name", "").strip()
+    admin = data.get("admin", "").strip()
+    members = data.get("members", [])
+    image = data.get("image", "")
+
+    if not name or not admin or not isinstance(members, list):
+        return jsonify({"status": False, "message": "Group name, admin, and members list are required."}), 400
+
+    # Ensure admin is included and deduplicate members
+    clean_members = list(dict.fromkeys([m.strip() for m in members if m.strip()] + [admin]))
+
+    if len(clean_members) < 2:
+        return jsonify({"status": False, "message": "A group must have at least 2 members."}), 400
+
+    group_doc = {
+        "name": name,
+        "admin": admin,
+        "members": clean_members,
+        "image": image,
+        "created_at": _now()
+    }
+    group_id = db.groups.insert_one(group_doc).inserted_id
+
+    group_payload = {
+        "id": str(group_id),
+        "name": name,
+        "admin": admin,
+        "members": clean_members,
+        "image": image,
+        "createdAt": group_doc["created_at"].isoformat()
+    }
+
+    # Notify all members in real time via Socket.IO
+    for member_phone in clean_members:
+        socketio.emit("group_created", group_payload, room=member_phone)
+
+    return jsonify({"status": True, "group": group_payload}), 201
+
+@app.route("/groups", methods=["GET"])
+def get_groups():
+    """Fetches all groups that a given phone number belongs to."""
+    phone = request.args.get("phone", "").strip()
+    if not phone:
+        return jsonify([]), 200
+
+    groups = [{
+        "id": str(g["_id"]),
+        "name": g.get("name", "Unnamed Group"),
+        "admin": g.get("admin", ""),
+        "members": g.get("members", []),
+        "image": g.get("image", ""),
+        "createdAt": g["created_at"].isoformat() if g.get("created_at") else ""
+    } for g in db.groups.find({"members": phone}).sort("created_at", -1)]
+    return jsonify(groups), 200
 
 # ===========================================================================
 # HTTP API — PUBLIC KEY DISTRIBUTION
@@ -197,7 +260,7 @@ def fetch_keys():
     }), 200
 
 # ===========================================================================
-# SOCKET.IO — REAL-TIME MESSAGING
+# SOCKET.IO — REAL-TIME MESSAGING (1-ON-1, GROUP FAN-OUT & FORWARDING)
 # ===========================================================================
 @socketio.on("connect")
 def handle_connect():
@@ -219,17 +282,20 @@ def handle_register(data):
     # Deliver offline messages
     pending = list(db.messages.find({"receiver": phone, "status": 1}).sort("timestamp", 1))
     for msg in pending:
+        effective_msg_id = msg.get("clientMsgId") or str(msg["_id"])
         payload = {
-            "msgId": str(msg["_id"]), "sender": msg["sender"], "receiver": msg["receiver"], 
+            "msgId": effective_msg_id, "sender": msg["sender"], "receiver": msg["receiver"], 
             "ciphertext": msg.get("ciphertext", ""), "header": msg.get("header", {}), 
             "dateTime": msg["timestamp"].isoformat(), "status": 2
         }
+        if msg.get("groupId"):
+            payload["groupId"] = msg["groupId"]
         if msg.get("alice_ik_pub"):
-             payload.update({"alice_ik_pub": msg["alice_ik_pub"], "alice_ek_pub": msg["alice_ek_pub"], "otpk_index": msg.get("otpk_index"), "is_session_init": True})
+            payload.update({"alice_ik_pub": msg["alice_ik_pub"], "alice_ek_pub": msg["alice_ek_pub"], "otpk_index": msg.get("otpk_index"), "is_session_init": True})
         
         emit("receive_message", payload, room=phone)
         db.messages.update_one({"_id": msg["_id"]}, {"$set": {"status": 2}})
-        emit("message_status", {"msgId": str(msg["_id"]), "status": 2}, room=msg["sender"])
+        emit("message_status", {"msgId": effective_msg_id, "status": 2}, room=msg["sender"])
 
 @socketio.on("send_message")
 def handle_message(data):
@@ -237,43 +303,118 @@ def handle_message(data):
     ciphertext, header = data.get("ciphertext"), data.get("header", {})
     if not sender or not receiver or not ciphertext: return
 
-    msg_doc = {"sender": sender, "receiver": receiver, "ciphertext": ciphertext, "header": header, "timestamp": _now(), "status": 1}
+    client_msg_id = data.get("clientMsgId", "").strip()
+    group_id = data.get("groupId", "").strip()
+
+    msg_doc = {
+        "sender": sender, "receiver": receiver, 
+        "ciphertext": ciphertext, "header": header, 
+        "timestamp": _now(), "status": 1
+    }
+    if client_msg_id:
+        msg_doc["clientMsgId"] = client_msg_id
+    if group_id:
+        msg_doc["groupId"] = group_id
     if data.get("is_session_init"):
         msg_doc.update({"alice_ik_pub": data.get("alice_ik_pub"), "alice_ek_pub": data.get("alice_ek_pub"), "otpk_index": data.get("otpk_index")})
 
-    msg_id = db.messages.insert_one(msg_doc).inserted_id
+    inserted_id = db.messages.insert_one(msg_doc).inserted_id
+    effective_msg_id = client_msg_id if client_msg_id else str(inserted_id)
 
     # Real-time delivery if online
     receiver_user = db.users.find_one({"phone": receiver})
     payload = {
-        "msgId": str(msg_id), "sender": sender, "receiver": receiver, 
+        "msgId": effective_msg_id, "sender": sender, "receiver": receiver, 
         "ciphertext": ciphertext, "header": header, "dateTime": msg_doc["timestamp"].isoformat(), "status": 2
     }
+    if group_id:
+        payload["groupId"] = group_id
     
     if data.get("is_session_init"):
         payload.update({"alice_ik_pub": msg_doc.get("alice_ik_pub"), "alice_ek_pub": msg_doc.get("alice_ek_pub"), "otpk_index": msg_doc.get("otpk_index"), "is_session_init": True})
 
     if receiver_user and receiver_user.get("online"):
         emit("receive_message", payload, room=receiver)
-        db.messages.update_one({"_id": msg_id}, {"$set": {"status": 2}})
-        emit("message_status", {"msgId": str(msg_id), "status": 2}, room=sender)
+        db.messages.update_one({"_id": inserted_id}, {"$set": {"status": 2}})
+        emit("message_status", {"msgId": effective_msg_id, "status": 2}, room=sender)
     else:
-        emit("message_status", {"msgId": str(msg_id), "status": 1}, room=sender)
+        emit("message_status", {"msgId": effective_msg_id, "status": 1}, room=sender)
 
-# --- NEW: Blind Relay for Message Deletion ---
+# --- Blind Relay for Message Deletion (1-on-1 & Group) ---
 @socketio.on("delete_message")
 def handle_delete_message(data):
     receiver = data.get("receiver", "").strip()
     msg_id = data.get("msgId", "")
+    group_id = data.get("groupId", "")
     if receiver and msg_id:
-        # Relay deletion trigger directly to the recipient's room
-        emit("message_deleted", {"msgId": msg_id}, room=receiver)
+        emit("message_deleted", {"msgId": msg_id, "groupId": group_id}, room=receiver)
+
+# --- Blind Relay for Message Editing (1-on-1 & Group) ---
+@socketio.on("edit_message")
+def handle_edit_message(data):
+    receiver = data.get("receiver", "").strip()
+    msg_id = data.get("msgId", "")
+    ciphertext = data.get("ciphertext", "")
+    header = data.get("header", {})
+    group_id = data.get("groupId", "")
+    sender = data.get("sender", "").strip()
+    if receiver and msg_id and ciphertext:
+        emit("message_edited", {
+            "msgId": msg_id,
+            "sender": sender,
+            "ciphertext": ciphertext,
+            "header": header,
+            "groupId": group_id
+        }, room=receiver)
 
 @socketio.on("message_read")
 def handle_read(data):
     sender, receiver = data.get("sender", "").strip(), data.get("receiver", "").strip()
     if db.messages.update_many({"sender": sender, "receiver": receiver, "status": {"$lt": 3}}, {"$set": {"status": 3}}).modified_count > 0:
         emit("message_status", {"status": 3}, room=sender)
+
+# ===========================================================================
+# SOCKET.IO — WEBRTC SIGNALING (1-ON-1 & GROUP VOICE/VIDEO CALLS)
+# ===========================================================================
+@socketio.on("call_invite")
+def handle_call_invite(data):
+    """
+    Routes an incoming call ring to a specific target user (1-on-1 or Group fan-out).
+    Expected data: { callId, callerPhone, callerName, targetPhone, callType ('audio'|'video'), groupId, groupName, participants }
+    """
+    target_phone = data.get("targetPhone", "").strip()
+    if target_phone:
+        emit("incoming_call", data, room=target_phone)
+
+@socketio.on("call_response")
+def handle_call_response(data):
+    """
+    Notifies caller/participants when a user accepts, rejects, or is busy.
+    Expected data: { callId, responderPhone, responderName, targetPhone, accepted (bool), reason }
+    """
+    target_phone = data.get("targetPhone", "").strip()
+    if target_phone:
+        emit("call_response", data, room=target_phone)
+
+@socketio.on("webrtc_signal")
+def handle_webrtc_signal(data):
+    """
+    Blindly routes P2P WebRTC SDP Offers, Answers, and ICE Candidates between two peers.
+    Expected data: { callId, senderPhone, senderName, targetPhone, type ('offer'|'answer'|'ice-candidate'), sdp, candidate, callType }
+    """
+    target_phone = data.get("targetPhone", "").strip()
+    if target_phone:
+        emit("webrtc_signal", data, room=target_phone)
+
+@socketio.on("call_end")
+def handle_call_end(data):
+    """
+    Notifies peer(s) that a user has left or ended the call.
+    Expected data: { callId, senderPhone, targetPhone }
+    """
+    target_phone = data.get("targetPhone", "").strip()
+    if target_phone:
+        emit("call_ended", data, room=target_phone)
 
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
